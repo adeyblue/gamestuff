@@ -1,0 +1,7 @@
+*.suo
+*.csproj.user
+bin
+Backup
+obj
+.vs
+*.htm
