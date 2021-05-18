@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -30,32 +31,6 @@ namespace GameStuff
             br.BaseStream.Seek(-numBytes, SeekOrigin.Current);
         }
 
-        static bool IsValidPaletteName(string name)
-        {
-            if (name.IndexOf("_P") != -1)
-            {
-                return true;
-            }
-            int len = name.Length;
-            int firstNonAlpha = len;
-            for (int i = 0; i < len; ++i)
-            {
-                char ch = name[i];
-                if (!(
-                        (ch >= 'A' && ch <= 'Z') ||
-                        (ch >= 'a' && ch <= 'z') ||
-                        (ch >= '0' && ch <= '9') ||
-                        (ch == '_' || ch == '-')
-                    )
-                )
-                {
-                    firstNonAlpha = i;
-                    break;
-                }
-            }
-            return firstNonAlpha > 5;
-        }
-
         // palette table format (0x1a size)
         // 0 - name
         // 0xb - unk
@@ -64,19 +39,21 @@ namespace GameStuff
         static List<ushort[]> ReadPalettes(BinaryReader br, int paletteOffset, int numPalettes, string outDir)
         {
             const int PALETTE_DATA_SIZE = 0x1a;
+            if (numPalettes < 1)
+            {
+                throw new InvalidDataException("Invalid image");
+            }
             StringBuilder sb = new StringBuilder();
             List<ushort[]> palettes = new List<ushort[]>(numPalettes);
             long curPos = br.BaseStream.Position;
             br.BaseStream.Seek(paletteOffset, SeekOrigin.Begin);
+            sb.AppendFormat("Found {0} palettes:", numPalettes);
+            sb.AppendLine();
             for (int i = 0; i < numPalettes; ++i)
             {
                 long preName = br.BaseStream.Position;
                 string name = ReadString(br, NAME_LEN);
                 br.BaseStream.Seek(preName, SeekOrigin.Begin);
-                if (!IsValidPaletteName(name))
-                {
-                    break;
-                }
                 Console.WriteLine("\tReading palette: {0}", name);
                 sb.AppendLine(name);
                 DumpData(sb, br, PALETTE_DATA_SIZE);
@@ -84,7 +61,7 @@ namespace GameStuff
                 br.ReadBytes(0xc);
                 short numColours = br.ReadInt16();
                 int palOffset = br.ReadInt32();
-                if(i < (numPalettes - 1))
+                if (i < (numPalettes - 1))
                 {
                     br.BaseStream.Seek(8, SeekOrigin.Current);
                 }
@@ -93,7 +70,7 @@ namespace GameStuff
                 ushort[] colours = new ushort[numColours];
                 byte[] colourData = br.ReadBytes(numColours * sizeof(ushort));
                 Buffer.BlockCopy(colourData, 0, colours, 0, colourData.Length);
-                for(int j = 0; j < colours.Length; ++j)
+                for (int j = 0; j < colours.Length; ++j)
                 {
                     colours[j] = (ushort)(colours[j] |= 0x8000);
                 }
@@ -108,19 +85,19 @@ namespace GameStuff
         static string ReadString(BinaryReader br, int len)
         {
             byte[] nameBytes = br.ReadBytes(len);
-            if(nameBytes.Length == 0)
+            if (nameBytes.Length == 0)
             {
                 return String.Empty;
             }
             int i = 0;
-            for(; i < len; ++i)
+            for (; i < len; ++i)
             {
-                if(nameBytes[i] == 0)
+                if (nameBytes[i] == 0)
                 {
                     break;
                 }
             }
-            for(; i < len; ++i)
+            for (; i < len; ++i)
             {
                 nameBytes[i] = 0;
             }
@@ -130,106 +107,189 @@ namespace GameStuff
         class Image
         {
             public string Name { get; private set; }
-            public short Width {get; private set;}
-            public short Height {get; private set;}
-            public byte[] ImageData {get; private set;}
-            public List<ushort[]> PotentialPalettes { get; private set; }
+            public short Width { get; private set; }
+            public short Height { get; private set; }
+            public short CanvasWidth { get; private set; }
+            public short CanvasHeight { get; private set; }
+            public byte[] ImageData { get; private set; }
+            public ushort[] Palette { get; private set; }
 
-            public Image(string name_, short width_, short height_, byte[] fileData_, List<ushort[]> palettes_)
+            public Image(string name_, short width_, short height_, byte[] fileData_, ushort[] palette_)
             {
+                // chop off the leading ! so that any that are part of a sequence
+                // are collated mext to the rest that don't start with a !
+                name_ = name_.TrimStart('!');
                 Name = name_;
-                Width = width_;
-                Height = height_;
+                CanvasWidth = Width = width_;
+                CanvasHeight = Height = height_;
                 ImageData = fileData_;
-                PotentialPalettes = palettes_;
+                Palette = palette_;
+            }
+
+            public void UpdateCanvasSize(short width, short height)
+            {
+                CanvasHeight = height;
+                CanvasWidth = width;
+            }
+
+            public override string ToString()
+            {
+                return String.Format("{0} - {1}x{2} ({3}x{4})", Name, Width, Height, CanvasWidth, CanvasHeight);
             }
         }
 
         static Color FromRGB555(ushort value)
         {
-            int r = value & 0x1f;
+            int b = value & 0x1f;
             int g = (value >> 5) & 0x1f;
-            int b = (value >> 10) & 0x1f;
-            const float scaleFactor = 0xff / 0x1f;
+            int r = (value >> 10) & 0x1f;
+            const float scaleFactor = 0xff / (float)0x1f;
             return Color.FromArgb((int)(r * scaleFactor), (int)(g * scaleFactor), (int)(b * scaleFactor));
         }
 
-        static void SaveImages(short canvasWidth, short canvasHeight, List<Image> images, string outDir)
+        static Color FindTopLeftColour(byte[] imgData, ushort[] palette)
         {
-            Rectangle lockRect = new Rectangle(0, 0, canvasWidth, canvasHeight);
+            int numColours = palette.Length;
+            foreach(byte b in imgData)
+            {
+                if(b < numColours)
+                {
+                    return FromRGB555(palette[b]);
+                }
+            }
+            return Color.Transparent;
+        }
+
+        static void SaveImages(List<Image> images, string outDir)
+        {
             PixelFormat pf = PixelFormat.Format16bppArgb1555;
             foreach (Image im in images)
             {
+                int canvasWidth = im.CanvasWidth;
+                int canvasHeight = im.CanvasHeight;
+                Rectangle lockRect = new Rectangle(0, 0, canvasWidth, canvasHeight);
                 string imName = im.Name;
                 string imgDir = Path.Combine(outDir, imName);
                 Console.WriteLine("\tProcessing image {0}", imName);
+                Debug.WriteLine(String.Format("Processing image {0}", imName));
                 int imWidth = im.Width;
                 byte[] imageData = im.ImageData;
                 short[] rowColours = new short[imWidth];
-                GCHandle rowColoursHandle = GCHandle.Alloc(rowColours, GCHandleType.Pinned);
-                IntPtr rowColoursSrc = rowColoursHandle.AddrOfPinnedObject();
                 int stride = (imWidth + 3) & ~3;
-                int palIndex = 0;
-                foreach(ushort[] palette in im.PotentialPalettes)
+                ushort[] palette = im.Palette;
+                int numColours = palette.Length;
+                int imageDataRowIndex = 0;
+                using (Bitmap bmBack = new Bitmap(canvasWidth, canvasHeight, PixelFormat.Format32bppArgb))
                 {
-                    int numColours = palette.Length;
-                    int imageDataRowIndex = 0;
-                    using (Bitmap bmBack = new Bitmap(canvasWidth, canvasHeight, PixelFormat.Format32bppArgb))
+                    int startRow = canvasHeight - im.Height;
+                    int startX = (canvasWidth - imWidth) / 2;
+                    Color tlColour = FindTopLeftColour(imageData, palette);
+                    using (Graphics g = Graphics.FromImage(bmBack))
                     {
-                        int startRow = canvasHeight - im.Height;
-                        int startX = (canvasWidth - imWidth) / 2;
-                        byte tlIndex = imageData[0];
-                        if(numColours <= tlIndex)
-                        {
-                            goto nextPalette;
-                        }
-                        //Color tlColour = FromRGB555(palette[tlIndex]);
-                        //using (Graphics g = Graphics.FromImage(bmBack))
-                        //{
-                        //    g.Clear(Color.Transparent);
-                        //}
-                        using (Bitmap bm = bmBack.Clone(lockRect, pf))
-                        {
-                            BitmapData bmData = bm.LockBits(lockRect, ImageLockMode.WriteOnly, pf);
-                            int bmStride = bmData.Stride;
-                            IntPtr pBmDataPtr = new IntPtr(bmData.Scan0.ToInt64() + (startRow * bmStride) + (startX * sizeof(ushort)));
-                            for (int y = 0; y < im.Height; ++y)
-                            {
-                                for (int x = 0; x < imWidth; ++x)
-                                {
-                                    byte colourIndex = imageData[imageDataRowIndex + x];
-                                    // since we don't know which palette goes with which image
-                                    // and the palettes have different number of colours in them
-                                    // if we get an out of bounds colour, then this is obviously a
-                                    // bad palette for this image
-                                    if (colourIndex >= numColours)
-                                    {
-                                        goto nextPalette;
-                                    }
-                                    rowColours[x] = (short)palette[colourIndex];
-                                }
-                                Marshal.Copy(rowColours, 0, pBmDataPtr, imWidth);
-                                pBmDataPtr = new IntPtr(pBmDataPtr.ToInt64() + bmStride);
-                                imageDataRowIndex += stride;
-                            }
-                            bm.UnlockBits(bmData);
-                            string fileName = Path.Combine(outDir, String.Format("{0}-p{1}.png", im.Name, palIndex));
-                            bm.Save(fileName, ImageFormat.Png);
-                        }
+                        g.Clear(tlColour);
                     }
-                    ++palIndex;
-                nextPalette:
-                    ;
+                    using (Bitmap bm = bmBack.Clone(lockRect, pf))
+                    {
+                        BitmapData bmData = bm.LockBits(lockRect, ImageLockMode.WriteOnly, pf);
+                        int bmStride = bmData.Stride;
+                        IntPtr pBmDataPtr = new IntPtr(bmData.Scan0.ToInt64() + (startRow * bmStride) + (startX * sizeof(ushort)));
+                        for (int y = 0; y < im.Height; ++y)
+                        {
+                            for (int x = 0; x < imWidth; ++x)
+                            {
+                                byte colourIndex = imageData[imageDataRowIndex + x];
+                                if (colourIndex >= palette.Length)
+                                {
+                                    Debug.WriteLine(String.Format("\tRequest for colour id {0} outside of palette bounds {1}", colourIndex, palette.Length));
+                                    continue;
+                                }
+                                rowColours[x] = (short)palette[colourIndex];
+                            }
+                            Marshal.Copy(rowColours, 0, pBmDataPtr, imWidth);
+                            pBmDataPtr = new IntPtr(pBmDataPtr.ToInt64() + bmStride);
+                            imageDataRowIndex += stride;
+                        }
+                        bm.UnlockBits(bmData);
+                        string fileName = Path.Combine(outDir, String.Format("{0}.png", im.Name));
+                        bm.Save(fileName, ImageFormat.Png);
+                    }
                 }
-                rowColoursHandle.Free();
             }
         }
 
+        static string GetGoodSequenceNamePart(string name)
+        {
+            // check if this name ends with two numbers, if so, return the unnumbered stem
+            // otherwise fail since it isn't part of a sequence (that we can automatically detect)
+            if (name.Length < 3) return null;
+            string lastTwo = name.Substring(name.Length - 2);
+            if (Char.IsDigit(lastTwo[0]) && Char.IsDigit(lastTwo[1]))
+            {
+                return name.Substring(0, name.Length - 2);
+            }
+            return null;
+        }
+
+        static void AmendSequenceCanvasSize(List<Image> thisSequence)
+        {
+            short widest = 0, tallest = 0;
+            foreach(Image im in thisSequence)
+            {
+                widest = Math.Max(widest, im.Width);
+                tallest = Math.Max(tallest, im.Height);
+            }
+            foreach(Image im in thisSequence)
+            {
+                im.UpdateCanvasSize(widest, tallest);
+            }
+        }
+
+        static void ResizeSequences(List<Image> images)
+        {
+            string lastPart = null;
+            List<Image> thisSequence = new List<Image>();
+            images.Sort((x, y) => { return x.Name.CompareTo(y.Name); });
+            foreach (Image im in images)
+            {
+                string thisPart = GetGoodSequenceNamePart(im.Name);
+                if (thisPart != lastPart)
+                {
+                    if (lastPart != null)
+                    {
+                        if (thisSequence.Count > 1)
+                        {
+                            AmendSequenceCanvasSize(thisSequence);
+                        }
+                    }
+                    thisSequence.Clear();
+                    thisSequence.Add(im);
+                    lastPart = thisPart;
+                }
+                else
+                {
+                    thisSequence.Add(im);
+                }
+            }
+            if (lastPart != null)
+            {
+                if (thisSequence.Count > 1)
+                {
+                    AmendSequenceCanvasSize(thisSequence);
+                }
+            }
+        }
+
+        // File header format
+        // 0 = num images
+        // 0x2 - number of palettes + 3? (ie 4 when there's one palette, 0x10 when there's 13)
+        // 0x4 - file table offset
+        // 0x8 - 
+        //
         // File table offset format (0x32 size)
         // 0 - name (until null)
         // 0x16 - width (image stride is next multiple of 4)
         // 0x18 - height
-        // 0x1a - palette? 
+        // 0x1a - palette + 3
         // 0x1c - file data offset - 8bpp, 
         static void ProcessImage(string imgFile, string outDir)
         {
@@ -243,8 +303,6 @@ namespace GameStuff
             MemoryStream ms = new MemoryStream(fileData);
             List<ushort[]> palettes;
             List<Image> images;
-            short widest = 0;
-            short tallest = 0;
             string imgFileName = Path.GetFileName(imgFile);
             Console.WriteLine("Processing {0}", imgFileName);
             string imgOutDir = Path.Combine(outDir, imgFileName);
@@ -253,11 +311,10 @@ namespace GameStuff
             {
                 int numImages = br.ReadInt16();
                 images = new List<Image>(numImages);
-                int numUnk = br.ReadInt16();
+                int numPalettes = br.ReadInt16() - 3;
                 int fileTableOffset = br.ReadInt32();
                 int palettesOffset = fileTableOffset + (numImages * 0x32);
                 int fileSize = fileData.Length;
-                int numPalettes = (fileSize - palettesOffset) / 0x12;
                 palettes = ReadPalettes(br, palettesOffset, numPalettes, imgOutDir);
                 br.BaseStream.Seek(fileTableOffset, SeekOrigin.Begin);
                 for (int i = 0; i < numImages; ++i)
@@ -272,19 +329,18 @@ namespace GameStuff
                     br.ReadBytes(0x16);
                     short width = br.ReadInt16();
                     short height = br.ReadInt16();
+                    int palIndex = br.ReadInt16() - 3;
                     int stride = (width + 3) & ~3;
-                    short unk = br.ReadInt16();
                     int dataOffset = br.ReadInt32();
                     byte[] imgData = new byte[stride * height];
                     br.ReadBytes(0x32 - 0x20);
                     Buffer.BlockCopy(fileData, dataOffset, imgData, 0, imgData.Length);
-                    images.Add(new Image(imName, width, height, imgData, palettes));
-                    if (width > widest) widest = width;
-                    if (height > tallest) tallest = height;
+                    images.Add(new Image(imName, width, height, imgData, palettes[palIndex]));
                 }
             }
+            ResizeSequences(images);
             File.WriteAllText(Path.Combine(imgOutDir, "images.txt"), sb.ToString());
-            SaveImages(widest, tallest, images, imgOutDir);
+            SaveImages(images, imgOutDir);
         }
 
         static void ProcessDir(string inDir, string outDir)
@@ -303,7 +359,14 @@ namespace GameStuff
             string[] dirImgs = Directory.GetFiles(inDir, "*.img");
             foreach (string imgFile in dirImgs)
             {
-                ProcessImage(imgFile, outDir);
+                try
+                {
+                    ProcessImage(imgFile, outDir);
+                }
+                catch(InvalidDataException)
+                {
+                    Console.WriteLine("{0} is an invalid img", imgFile);
+                }
             }
         }
 
