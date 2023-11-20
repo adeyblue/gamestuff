@@ -6,6 +6,7 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace GameStuff
 {
@@ -183,7 +184,8 @@ namespace GameStuff
                 {
                     int startRow = canvasHeight - im.Height;
                     int startX = (canvasWidth - imWidth) / 2;
-                    Color tlColour = FindTopLeftColour(imageData, palette);
+                    //Color tlColour = FindTopLeftColour(imageData, palette);
+                    Color tlColour = Color.Transparent;
                     using (Graphics g = Graphics.FromImage(bmBack))
                     {
                         g.Clear(tlColour);
@@ -221,13 +223,23 @@ namespace GameStuff
         {
             // check if this name ends with two numbers, if so, return the unnumbered stem
             // otherwise fail since it isn't part of a sequence (that we can automatically detect)
-            if (name.Length < 3) return null;
-            string lastTwo = name.Substring(name.Length - 2);
-            if (Char.IsDigit(lastTwo[0]) && Char.IsDigit(lastTwo[1]))
+            string noExt = Path.GetFileNameWithoutExtension(name);
+            MatchCollection coll = Regex.Matches(noExt, "\\d+");
+            if (coll.Count == 0)
             {
-                return name.Substring(0, name.Length - 2);
+                return null;
             }
-            return null;
+            Match longest = null;
+            foreach (Match m in coll)
+            {
+                // we want >=, so we prefer numbers towards the end of the name
+                // rather than at the beginning
+                if ((longest == null) || (m.Length >= longest.Length))
+                {
+                    longest = m;
+                }
+            }
+            return noExt.Substring(0, longest.Index);
         }
 
         static void AmendSequenceCanvasSize(List<Image> thisSequence)
@@ -244,11 +256,22 @@ namespace GameStuff
             }
         }
 
+        private class LogicalComparer : IComparer<Image>
+        {
+            [DllImport("shlwapi.dll", EntryPoint = "StrCmpLogicalW", CallingConvention = CallingConvention.Winapi, ExactSpelling = true, PreserveSig = true)]
+            private static extern int StrCmpLogical([MarshalAs(UnmanagedType.LPWStr)] string a, [MarshalAs(UnmanagedType.LPWStr)] string b);
+
+            public int Compare(Image x, Image y)
+            {
+                return StrCmpLogical(x.Name, y.Name);
+            }
+        }
+
         static void ResizeSequences(List<Image> images)
         {
             string lastPart = null;
             List<Image> thisSequence = new List<Image>();
-            images.Sort((x, y) => { return x.Name.CompareTo(y.Name); });
+            images.Sort(new LogicalComparer());
             foreach (Image im in images)
             {
                 string thisPart = GetGoodSequenceNamePart(im.Name);
@@ -370,7 +393,7 @@ namespace GameStuff
             }
         }
 
-        static void Main(string[] args)
+        static void OrigMain(string[] args)
         {
             if ((args.Length < 2) || (!(Directory.Exists(args[0])) && (Directory.Exists(args[1]))))
             {
@@ -387,6 +410,59 @@ namespace GameStuff
                 }
             }
             ProcessDir(args[0], args[1]);
+        }
+
+        static void ExtractDOSSounds(string dosCDFilesDir, string outDir)
+        {
+            string[] sndFiles = Directory.GetFiles(dosCDFilesDir, "*.SND");
+            foreach(string sndFile in sndFiles)
+            {
+                string fileStem = Path.GetFileNameWithoutExtension(sndFile);
+                byte[] fileData = File.ReadAllBytes(sndFile);
+                int sndEnd = fileData.Length;
+                if (sndEnd <= 8) continue;
+                using(MemoryStream ms = new MemoryStream(fileData))
+                using(BinaryReader br = new BinaryReader(ms))
+                {
+                    // first file start is where the header ends
+                    int fileStart = br.ReadInt32();
+                    int fileEnd = fileStart;
+                    int numFiles = fileStart / sizeof(int);
+                    for(int i = 1; i < numFiles; ++i)
+                    {
+                        fileStart = fileEnd;
+                        int temp = br.ReadInt32();
+                        // because there are some 0 entries for some reason
+                        if (temp == 0) continue;
+                        fileEnd = temp;
+                        string newFile = String.Format("{0}-{1:D3}.wav", fileStem, i);
+                        Console.WriteLine("Creating file {0} from bytes {1:x}-{2:x}", newFile, fileStart, fileEnd);
+                        using(FileStream fs = File.OpenWrite(Path.Combine(outDir, newFile)))
+                        {
+                            fs.Write(fileData, fileStart, fileEnd - fileStart);
+                        }
+                    }
+                }
+            }
+        }
+
+        static void Main(string[] args)
+        {
+            if ((args.Length < 2) || (!(Directory.Exists(args[0])) && (Directory.Exists(args[1]))))
+            {
+                if (!(Directory.Exists(args[0]) && Directory.Exists(args[1])))
+                {
+                    Console.WriteLine(
+                        "Usage: WWFDOSSndExtract <WWFDir> <OutDir>{0}" +
+                        "{0}" +
+                        "<WWFDir> needs to be where the WWF Wrestlemania DOS CD files are{0}" +
+                        "<OutDir> is where to save the wavs{0}",
+                        Environment.NewLine
+                    );
+                    return;
+                }
+            }
+            ExtractDOSSounds(args[0], args[1]);
         }
     }
 }
